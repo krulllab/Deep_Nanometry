@@ -21,11 +21,10 @@ class ResidualBlock(nn.Module):
     For example, bacdbacd has 2x (batchnorm, activation, conv, dropout).
     """
 
-    default_kernel_size = (3, 3)
+    default_kernel_size = 3
 
     def __init__(self,
                  channels,
-                 nonlin,
                  kernel=None,
                  groups=1,
                  batchnorm=True,
@@ -37,86 +36,78 @@ class ResidualBlock(nn.Module):
             kernel = self.default_kernel_size
         elif isinstance(kernel, int):
             kernel = (kernel, kernel)
-        elif len(kernel) != 2:
+        elif len(kernel) != 1:
             raise ValueError(
-                "kernel has to be None, int, or an iterable of length 2")
-        assert all([k % 2 == 1 for k in kernel]), "kernel sizes have to be odd"
-        kernel = list(kernel)
-        pad = [k // 2 for k in kernel]
+                "kernel has to be None, or int")
+        assert kernel % 2 == 1, "kernel sizes have to be odd"
+        pad = kernel // 2
         self.gated = gated
 
         modules = []
-
         if block_type == 'cabdcabd':
             for i in range(2):
-                conv = nn.Conv2d(channels,
+                conv = nn.Conv1d(channels,
                                  channels,
-                                 kernel[i],
-                                 padding=pad[i],
+                                 kernel,
+                                 padding=pad,
                                  groups=groups)
                 modules.append(conv)
-                modules.append(nonlin())
+                modules.append(nn.ELU())
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
+                    modules.append(nn.BatchNorm1d(channels))
                 if dropout is not None:
-                    modules.append(nn.Dropout2d(dropout))
+                    modules.append(nn.Dropout1d(dropout))
 
         elif block_type == 'bacdbac':
             for i in range(2):
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
-                modules.append(nonlin())
-                conv = nn.Conv2d(channels,
+                    modules.append(nn.BatchNorm1d(channels))
+                modules.append(nn.ELU())
+                conv = nn.Conv1d(channels,
                                  channels,
-                                 kernel[i],
-                                 padding=pad[i],
+                                 kernel,
+                                 padding=pad,
                                  groups=groups)
                 modules.append(conv)
                 if dropout is not None and i == 0:
-                    modules.append(nn.Dropout2d(dropout))
+                    modules.append(nn.Dropout1d(dropout))
 
         elif block_type == 'bacdbacd':
             for i in range(2):
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
-                modules.append(nonlin())
-                conv = nn.Conv2d(channels,
+                    modules.append(nn.BatchNorm1d(channels))
+                modules.append(nn.ELU())
+                conv = nn.Conv1d(channels,
                                  channels,
-                                 kernel[i],
-                                 padding=pad[i],
+                                 kernel,
+                                 padding=pad,
                                  groups=groups)
                 modules.append(conv)
-                modules.append(nn.Dropout2d(dropout))
+                modules.append(nn.Dropout1d(dropout))
 
         else:
             raise ValueError("unrecognized block type '{}'".format(block_type))
 
         if gated:
-            modules.append(GateLayer2d(channels, 1, nonlin))
+            modules.append(GateLayer1d(channels, 1))
         self.block = nn.Sequential(*modules)
 
     def forward(self, x):
         return self.block(x) + x
 
 
-class ResidualGatedBlock(ResidualBlock):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, gated=True)
-
-
-class GateLayer2d(nn.Module):
+class GateLayer1d(nn.Module):
     """
     Double the number of channels through a convolutional layer, then use
     half the channels as gate for the other half.
     """
 
-    def __init__(self, channels, kernel_size, nonlin=nn.LeakyReLU):
+    def __init__(self, channels, kernel_size):
         super().__init__()
         assert kernel_size % 2 == 1
         pad = kernel_size // 2
-        self.conv = nn.Conv2d(channels, 2 * channels, kernel_size, padding=pad)
-        self.nonlin = nonlin()
+        self.conv = nn.Conv1d(channels, 2 * channels, kernel_size, padding=pad)
+        self.nonlin = nn.ELU()
 
     def forward(self, x):
         x = self.conv(x)

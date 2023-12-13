@@ -2,95 +2,67 @@ import numpy as np
 import torch
 from torch import nn
 from torch import optim
+from pytorch_lightning import LightningModule
 import matplotlib.pyplot as plt
 
-from HDN.lib.likelihoods import (GaussianLikelihood, NoiseModelLikelihood)
-from HDN.lib.utils import (crop_img_tensor, pad_img_tensor, Interpolate, free_bits_kl, plot_to_image)
-from HDN.models.lvae_layers import (TopDownLayer, BottomUpLayer,
-                          TopDownDeterministicResBlock,
-                          BottomUpDeterministicResBlock)
-
-from pytorch_lightning import LightningModule
+from ..lib.utils import crop_img_tensor, pad_img_tensor, plot_to_image
+from .lvae_layers import TopDownLayer, BottomUpLayer, TopDownDeterministicResBlock, BottomUpDeterministicResBlock
 
 
 class LadderVAE(LightningModule):
 
     def __init__(self,
-                 z_dims,               
                  data_mean,
                  data_std,
-                 color_ch=1,
-                 noiseModel=None,
-                 gaussian_noise_std=None,
-                 blocks_per_layer=5,
-                 nonlin='elu',
-                 merge_type='residual',
-                 batchnorm=True,
-                 stochastic_skip=True,
+                 img_width,
+                 noise_model,
+                 z_dims=None,
+                 blocks_per_layer=1,
                  n_filters=64,
-                 dropout=0.2,
-                 free_bits=0.0,
-                 learn_top_prior=True,
-                 img_shape=None,
                  res_block_type='bacdbacd',
+                 merge_type='residual',
+                 stochastic_skip=True,
                  gated=True,
-                 no_initial_downscaling=True,
-                 analytical_kl=True,
-                 mode_pred=False,
-                 use_uncond_mode_at=[],
-                 lr=3e-4,
-                 weight_decay=0):
+                 batchnorm=True,
+                 dropout=0,
+                 downsample=True,
+                 mode_pred=False):
+        if z_dims is None:
+            z_dims = [32] * 8
         self.save_hyperparameters()
         super().__init__()
-        self.color_ch = color_ch
-        self.z_dims = z_dims
-        self.gaussian_noise_std = gaussian_noise_std
-        self.blocks_per_layer = blocks_per_layer
-        self.n_layers = len(self.z_dims)
-        self.stochastic_skip = stochastic_skip
-        self.n_filters = n_filters
-        self.dropout = dropout
-        self.free_bits = free_bits
-        self.learn_top_prior = learn_top_prior
-        self.img_shape = tuple(img_shape)
-        self.res_block_type = res_block_type
-        self.gated = gated
         self.data_mean = data_mean
         self.data_std = data_std
-        self.mode_pred=mode_pred
-        self.use_uncond_mode_at=use_uncond_mode_at
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.val_count=0
-        
-        self.downsample = [1]*self.n_layers
+        self.img_width = img_width
+        self.noise_model = noise_model
+        self.z_dims = z_dims
+        self.n_layers = len(self.z_dims)
+        self.blocks_per_layer = blocks_per_layer
+        self.n_filters = n_filters
+        self.stochastic_skip = stochastic_skip
+        self.gated = gated
+        self.dropout = dropout
+        self.mode_pred = mode_pred
 
+        # Number of downsampling steps per layer
+        if downsample:
+            downsampling = [1] * self.n_layers
+        else:
+            downsampling = [0] * self.n_layers
+            
         # Downsample by a factor of 2 at each downsampling operation
-        self.overall_downscale_factor = np.power(2, sum(self.downsample))
-        if not no_initial_downscaling:  # by default do another downscaling
-            self.overall_downscale_factor *= 2
+        self.overall_downscale_factor = np.power(2, sum(downsampling))
 
-        assert max(self.downsample) <= self.blocks_per_layer
-        assert len(self.downsample) == self.n_layers
+        assert max(downsampling) <= self.blocks_per_layer
+        assert len(downsampling) == self.n_layers
 
-        # Get class of nonlinear activation from string description
-        nonlin = {
-            'relu': nn.ReLU,
-            'leakyrelu': nn.LeakyReLU,
-            'elu': nn.ELU,
-            'selu': nn.SELU,
-        }[nonlin]
-
-        # First bottom-up layer: change num channels + downsample by factor 2
-        # unless we want to prevent this
-        stride = 1 if no_initial_downscaling else 2
+        # First bottom-up layer: change num channels
         self.first_bottom_up = nn.Sequential(
-            nn.Conv2d(color_ch, n_filters, 5, padding=2, stride=stride),
-            nonlin(),
+            nn.Conv1d(1, n_filters, 5, padding=2, padding_mode='replicate'),
+            nn.ELU(),
             BottomUpDeterministicResBlock(
                 c_in=n_filters,
                 c_out=n_filters,
-                nonlin=nonlin,
                 batchnorm=batchnorm,
                 dropout=dropout,
                 res_block_type=res_block_type,
@@ -101,7 +73,6 @@ class LadderVAE(LightningModule):
         self.bottom_up_layers = nn.ModuleList([])
 
         for i in range(self.n_layers):
-
             # Whether this is the top layer
             is_top = i == self.n_layers - 1
 
@@ -112,8 +83,7 @@ class LadderVAE(LightningModule):
                 BottomUpLayer(
                     n_res_blocks=self.blocks_per_layer,
                     n_filters=n_filters,
-                    downsampling_steps=self.downsample[i],
-                    nonlin=nonlin,
+                    downsampling_steps=downsampling[i],
                     batchnorm=batchnorm,
                     dropout=dropout,
                     res_block_type=res_block_type,
@@ -131,98 +101,79 @@ class LadderVAE(LightningModule):
             #
             # When doing generation only, the value bu is not available, the
             # merge layer is not used, and z is sampled directly from p_params.
-            #
             self.top_down_layers.append(
                 TopDownLayer(
                     z_dim=z_dims[i],
                     n_res_blocks=blocks_per_layer,
                     n_filters=n_filters,
                     is_top_layer=is_top,
-                    downsampling_steps=self.downsample[i],
-                    nonlin=nonlin,
+                    downsampling_steps=downsampling[i],
                     merge_type=merge_type,
                     batchnorm=batchnorm,
                     dropout=dropout,
                     stochastic_skip=stochastic_skip,
-                    learn_top_prior=learn_top_prior,
                     top_prior_param_shape=self.get_top_prior_param_shape(),
                     res_block_type=res_block_type,
                     gated=gated,
-                    analytical_kl=analytical_kl,
                 ))
 
         # Final top-down layer
         modules = list()
-        if not no_initial_downscaling:
-            modules.append(Interpolate(scale=2))
         for i in range(blocks_per_layer):
             modules.append(
                 TopDownDeterministicResBlock(
                     c_in=n_filters,
                     c_out=n_filters,
-                    nonlin=nonlin,
                     batchnorm=batchnorm,
                     dropout=dropout,
                     res_block_type=res_block_type,
                     gated=gated,
                 ))
+        modules.append(
+            nn.Conv1d(n_filters,
+                      1,
+                      kernel_size=3,
+                      padding=1,
+                      padding_mode='replicate'))
         self.final_top_down = nn.Sequential(*modules)
 
-        # Define likelihood
-        if self.gaussian_noise_std is None:
-            self.likelihood = NoiseModelLikelihood(n_filters, color_ch, data_mean, data_std, noiseModel)
-        else:
-            self.likelihood = GaussianLikelihood(n_filters, color_ch)
-            
-
     def forward(self, x):
-        img_size = x.size()[2:]
+        img_size = x.size()[2]
 
-        # Pad input to make everything easier with conv strides
+        # Pad x to have base 2 side lengths to make resampling steps simpler
         x_pad = self.pad_input(x)
 
         # Bottom-up inference: return list of length n_layers (bottom to top)
         bu_values = self.bottomup_pass(x_pad)
 
         # Top-down inference/generation
-        out, td_data = self.topdown_pass(bu_values)
+        out, kl = self.topdown_pass(bu_values)
+
+        if not self.mode_pred:
+            kl_sums = [torch.sum(layer) for layer in kl]
+            kl_loss = sum(kl_sums) / float(x.shape[0] * x.shape[1] * x.shape[2])
+        else:
+            kl_loss = None
 
         # Restore original image size
-        out = crop_img_tensor(out, img_size)
-        
-        # Log likelihood and other info (per data point)
-        ll, likelihood_info = self.likelihood(out, x)
+        predicted_signal = crop_img_tensor(out, img_size)
 
-        if self.mode_pred is False:
-            # kl[i] for each i has length batch_size
-            # resulting kl shape: (batch_size, layers)
-            kl = torch.cat([kl_layer.unsqueeze(1) for kl_layer in td_data['kl']],
-                           dim=1)
+        x_denormalised = x * self.data_std + self.data_mean
+        predicted_signal_denormalised = predicted_signal * self.data_std + self.data_mean
 
-            kl_sep = kl.sum(1)
-            kl_avg_layerwise = kl.mean(0)
-            kl_loss = free_bits_kl(kl, self.free_bits).sum()  # sum over layers
-            kl = kl_sep.mean()
+        predicted_noise = x_denormalised - predicted_signal_denormalised
+
+        if not self.mode_pred:
+            # Noise model returns log[p(x|predicted_s)]
+            ll = self.noise_model.loglikelihood(predicted_noise)
+            ll = ll.mean()
         else:
-            kl = None
-            kl_sep = None
-            kl_avg_layerwise = None
-            kl_loss = None
-            kl = None
-            
+            ll = None
+
         output = {
             'll': ll,
-            'z': td_data['z'],
-            'kl': kl,
-            'kl_sep': kl_sep,
-            'kl_avg_layerwise': kl_avg_layerwise,
-            'kl_spatial': td_data['kl_spatial'],
             'kl_loss': kl_loss,
-            'logp': td_data['logprob_p'],
-            'out_mean': likelihood_info['mean'],
-            'out_mode': likelihood_info['mode'],
-            'out_sample': likelihood_info['sample'],
-            'likelihood_params': likelihood_info['params']
+            'predicted_signal': predicted_signal,
         }
         return output
 
@@ -251,7 +202,6 @@ class LadderVAE(LightningModule):
             mode_layers = []
         if constant_layers is None:
             constant_layers = []
-        prior_experiment = len(mode_layers) > 0 or len(constant_layers) > 0
 
         # If the bottom-up inference values are not given, don't do
         # inference, sample from prior instead
@@ -262,30 +212,16 @@ class LadderVAE(LightningModule):
             msg = ("Number of images for top-down generation has to be given "
                    "if and only if we're not doing inference")
             raise RuntimeError(msg)
-        if inference_mode and prior_experiment:
-            msg = ("Prior experiments (e.g. sampling from mode) are not"
-                   " compatible with inference mode")
-            raise RuntimeError(msg)
-
-        # Sampled latent variables at each layer
-        z = [None] * self.n_layers
 
         # KL divergence of each layer
         kl = [None] * self.n_layers
 
-        # Spatial map of KL divergence for each layer
-        kl_spatial = [None] * self.n_layers
-
         if forced_latent is None:
             forced_latent = [None] * self.n_layers
 
-        # log p(z) where z is the sample in the topdown pass
-        logprob_p = 0.
-
         # Top-down inference/generation loop
-        out = out_pre_residual = None
+        out = None
         for i in reversed(range(self.n_layers)):
-
             # If available, get deterministic node from bottom-up inference
             try:
                 bu_value = bu_values[i]
@@ -295,13 +231,12 @@ class LadderVAE(LightningModule):
             # Whether the current layer should be sampled from the mode
             use_mode = i in mode_layers
             constant_out = i in constant_layers
-            use_uncond_mode = i in self.use_uncond_mode_at
 
             # Input for skip connection
             skip_input = out  # TODO or out_pre_residual? or both?
 
             # Full top-down layer, including sampling and deterministic part
-            out, out_pre_residual, aux = self.top_down_layers[i](
+            out, kl_elementwise = self.top_down_layers[i](
                 out,
                 skip_connection_input=skip_input,
                 inference_mode=inference_mode,
@@ -310,27 +245,13 @@ class LadderVAE(LightningModule):
                 use_mode=use_mode,
                 force_constant_output=constant_out,
                 forced_latent=forced_latent[i],
-                mode_pred=self.mode_pred,
-                use_uncond_mode=use_uncond_mode
-            )
-            z[i] = aux['z']  # sampled variable at this layer (batch, ch, h, w)
-            kl[i] = aux['kl_samplewise']  # (batch, )
-            kl_spatial[i] = aux['kl_spatial']  # (batch, h, w)
-            if self.mode_pred is False:
-                logprob_p += aux['logprob_p'].mean()  # mean over batch
-            else:
-                logprob_p = None
+                mode_pred=self.mode_pred)
+            kl[i] = kl_elementwise  # (batch, ch, w)
+
         # Final top-down layer
         out = self.final_top_down(out)
 
-        data = {
-            'z': z,  # list of tensors with shape (batch, ch[i], h[i], w[i])
-            'kl': kl,  # list of tensors with shape (batch, )
-            'kl_spatial':
-                kl_spatial,  # list of tensors w shape (batch, h[i], w[i])
-            'logprob_p': logprob_p,  # scalar, mean over batch
-        }
-        return out, data
+        return out, kl
 
     def pad_input(self, x):
         """
@@ -338,142 +259,98 @@ class LadderVAE(LightningModule):
         :param x:
         :return: Padded tensor
         """
-        size = self.get_padded_size(x.size())
+        size = self.get_padded_size(x.size()[-1])
         x = pad_img_tensor(x, size)
         return x
 
     def get_padded_size(self, size):
-        """
-        Returns the smallest size (H, W) of the image with actual size given
-        as input, such that H and W are powers of 2.
-        :param size: input size, tuple either (N, C, H, w) or (H, W)
-        :return: 2-tuple (H, W)
-        """
-
         # Overall downscale factor from input to top layer (power of 2)
         dwnsc = self.overall_downscale_factor
 
-        # Make size argument into (heigth, width)
-        if len(size) == 4:
-            size = size[2:]
-        if len(size) != 2:
-            msg = ("input size must be either (N, C, H, W) or (H, W), but it "
-                   "has length {} (size={})".format(len(size), size))
-            raise RuntimeError(msg)
-
         # Output smallest powers of 2 that are larger than current sizes
-        padded_size = list(((s - 1) // dwnsc + 1) * dwnsc for s in size)
+        padded_size = ((size - 1) // dwnsc + 1) * dwnsc
 
         return padded_size
-
-    def sample_prior(self, n_imgs, mode_layers=None, constant_layers=None):
-
-        # Generate from prior
-        out, _ = self.topdown_pass(n_img_prior=n_imgs,
-                                   mode_layers=mode_layers,
-                                   constant_layers=constant_layers)
-        out = crop_img_tensor(out, self.img_shape)
-
-        # Log likelihood and other info (per data point)
-        _, likelihood_data = self.likelihood(out, None)
-
-        return likelihood_data['sample']
 
     def get_top_prior_param_shape(self, n_imgs=1):
         # TODO num channels depends on random variable we're using
         dwnsc = self.overall_downscale_factor
-        sz = self.get_padded_size(self.img_shape)
-        h = sz[0] // dwnsc
-        w = sz[1] // dwnsc
+        sz = self.get_padded_size(self.img_width)
+        w = sz // dwnsc
         c = self.z_dims[-1] * 2  # mu and logvar
-        top_layer_shape = (n_imgs, c, h, w)
+        top_layer_shape = (n_imgs, c, w)
         return top_layer_shape
-    
-    def training_step(self, batch, batch_idx):
+
+    def training_step(self, batch, _):
+        # Normalise data
         x = (batch - self.data_mean) / self.data_std
+        # Returns dictionary containing predicted signal and loss terms
         model_out = self.forward(x)
-        
-        if self.gaussian_noise_std is None:
-            recons_loss = -model_out['ll'].mean()
-        else:
-            recons_loss = -model_out['ll'].mean() / ((self.gaussian_noise_std/self.data_std)**2)
-            
-        kl_loss = model_out['kl_loss']/float(x.shape[2]*x.shape[3])
+
+        recons_loss = -model_out['ll']
+        kl_loss = model_out['kl_loss']
         elbo = recons_loss + kl_loss
-        
-        self.log('train/elbo', elbo)
-        self.log('train/reconstruction_loss', recons_loss)
-        self.log('train/kl_loss', kl_loss)
+
+        self.log_dict({
+            'train/elbo': elbo,
+            'train/kl_divergence': kl_loss,
+            'train/reconstruction_loss': recons_loss
+        })
+
         return elbo
-    
-    def log_images_for_tensorboard(self, pred, x, img_mmse):
-        clamped_input = torch.clamp((x - x.min()) / (x.max() - x.min()), 0, 1)
-        clamped_pred = torch.clamp((pred - pred.min()) / (pred.max() - pred.min()), 0, 1)
-        clamped_mmse = torch.clamp((img_mmse - img_mmse.min()) / (img_mmse.max() - img_mmse.min()), 0, 1)
-        self.trainer.logger.experiment.add_image('inputs/img', clamped_input[0],
-                                                     self.current_epoch)
-        for i in range(len(pred)):
-            self.trainer.logger.experiment.add_image('predcitions/sample_{}'.format(i), clamped_pred[i],
-                                                     self.current_epoch)
-        self.trainer.logger.experiment.add_image(f'predcitions/mmse ({len(pred)} samples)', clamped_mmse[0],
-                                                     self.current_epoch)
-        
-    def log_plots_for_tensorboard(self, pred, x, mmse):
+
+    def log_images_for_tensorboard(self, x, samples, median):
         figure = plt.figure()
-        plt.plot(x[0, 0, 0].cpu(), color="blue", label="Attenuated")
-        plt.plot(mmse[0, 0, 0].cpu(), color="orange", label="Denoised")
-        for i in range(len(pred)):
-            plt.plot(pred[i, 0, 0].cpu(), color="orange", alpha=0.2)
+        plt.plot(x[0, 0].cpu(), color="blue", label="Attenuated")
+        plt.plot(median[0, 0].cpu(), color="orange", label="Denoised")
+        for i in range(len(samples)):
+            plt.plot(samples[i, 0].cpu(), color="orange", alpha=0.2)
         plt.legend()
 
         self.trainer.logger.experiment.add_image("Validation_plot",
                                                  plot_to_image(figure),
                                                  self.current_epoch)
-    
+
     def validation_step(self, batch, batch_idx):
         x = (batch - self.data_mean) / self.data_std
         model_out = self.forward(x)
-        
-        if self.gaussian_noise_std is None:
-            recons_loss = -model_out['ll'].mean()
-        else:
-            recons_loss = -model_out['ll'].mean() / ((self.gaussian_noise_std/self.data_std)**2)
-            
-        kl_loss = model_out['kl_loss']/float(x.shape[2]*x.shape[3])
+
+        recons_loss = -model_out['ll']
+        kl_loss = model_out['kl_loss']
         elbo = recons_loss + kl_loss
-        
-        self.log('val/elbo', elbo)
-        self.log('val/reconstruction_loss', recons_loss)
-        self.log('val/kl_loss', kl_loss)
-        
+
+        self.log_dict({
+            'val/elbo': elbo,
+            'val/reconstruction_loss': recons_loss,
+            'val/kl_divergence': kl_loss
+        })
+
         if batch_idx == 0:
-            if x.shape[-2] >= 2:
-                    idx = np.random.randint(len(x))
-                    all_samples = self.forward(torch.repeat_interleave(x[idx:idx+1], x.shape[0], 0))['out_mean']
-                    mmse = torch.mean(all_samples, 0, keepdim=True)
-                    self.log_images_for_tensorboard(all_samples, x[idx:idx+1], mmse)
-            else:
-                idx = np.random.randint(len(x))
-                all_samples = self.forward(torch.repeat_interleave(x[idx:idx + 1], x.shape[0], 0))['out_mean']
-                mmse = torch.mean(all_samples, dim=0, keepdim=True)
-                self.log_plots_for_tensorboard(all_samples, x[idx:idx + 1], mmse)
-        
-        return elbo
-            
-        
+            # Display validation set results on tensorboard
+            # One noisy array, 10 predictions of its signal and their median
+            idx = np.random.randint(len(x))
+            samples = self.forward(
+                torch.repeat_interleave(x[idx:idx + 1], 10, 0))["predicted_signal"]
+            median = torch.quantile(samples, 0.5, dim=0, keepdim=True)
+            self.log_images_for_tensorboard(x[idx:idx + 1], samples, median)
+
+    def predict_step(self, batch, _):
+        # Don't calculate loss or carry out masking
+        self.mode_pred = True
+        x = (batch - self.data_mean) / self.data_std
+        out = self.forward(x)['predicted_signal']
+        out = out * self.data_std + self.data_mean
+        return out
+
     def configure_optimizers(self):
-        optimizer = optim.Adamax(self.parameters(), 
-                                 lr=self.lr,
-                                 weight_decay=self.weight_decay)
-        
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                         'min',
-                                                         patience=10,
-                                                         factor=0.5,
-                                                         min_lr=1e-12,
-                                                         verbose=True)
-        monitor = 'val/elbo'
-        
-        return{'optimizer':optimizer,
-               'lr_scheduler':scheduler,
-               'monitor':monitor}
+        optimizer = optim.Adamax(self.parameters(), lr=3e-4)
+        scheduler = {
+            'scheduler':
+                optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+                                                     factor=0.5,
+                                                     verbose=True),
+            'monitor':
+                'val/elbo'
+        }
+
+        return [optimizer], [scheduler]

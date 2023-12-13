@@ -1,11 +1,29 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.nn import init
-import numpy as np
+from torch.distributions import Normal, Categorical
 import pytorch_lightning as pl
-import sys
 from tqdm import tqdm
+
+
+def get_gaussian_params(params):
+    # Make weights positive and sum to 1
+    weights = params[:, 0::3]
+    weights = torch.softmax(weights, dim=1)
+
+    means = params[:, 1::3]
+
+    # Make scales positive
+    stds = params[:, 2::3]
+    stds = stds.exp()
+    return weights, means, stds
+
+
+def sampleFromMix(weights, means, stds):
+    mixture_samples = Normal(means, stds).rsample()
+    component_idx = Categorical(weights.moveaxis(1, 2)).sample()
+
+    return torch.gather(mixture_samples, dim=1, index=component_idx.unsqueeze(dim=1))
+
 
 class GMM(pl.LightningModule):
     """Gaussian mixture model.
@@ -22,23 +40,15 @@ class GMM(pl.LightningModule):
         used to normalise the data
 
     """
-    
+
     def __init__(self, n_gaussians, noise_mean, noise_std, lr):
-        super().__init__()  
+        super().__init__()
         self.n_gaussians = n_gaussians
         self.noise_mean = noise_mean
         self.noise_std = noise_std
         self.lr = lr
-        
-    def get_gaussian_params(self, pred):
-        blockSize = self.n_gaussians
-        means = pred[:,:blockSize,...]
-        stds = torch.sqrt(torch.exp(pred[:,blockSize:2*blockSize,...]))
-        weights = torch.exp(pred[:,2*blockSize:3*blockSize,...])
-        weights = weights / torch.sum(weights,dim = 1, keepdim = True)
-        return means, stds, weights   
-    
-    def loglikelihood(self, x, s=None):
+
+    def loglikelihood(self, x):
         """Calculates loglikelihood of noise input.
 
         Passes noise image through network to obtain Gaussian mixture model
@@ -49,12 +59,7 @@ class GMM(pl.LightningModule):
         Parameters
         ----------
         x : torch.FloatTensor
-            This is a noise sample when training the noise model, but, when using
-            the noise model to evaluate the denoiser, this is a noisy image.
-        s : torch.FloatTensor
-            When training the noise model, this should be left as none. When training
-            the denoiser this is the estimated signal and will be subtracted from the
-            noisy image to obtain a noise image.
+            Noise samples
 
         Returns
         -------
@@ -62,91 +67,65 @@ class GMM(pl.LightningModule):
             The elementwise loglikelihood of the input.
 
         """
-        
-        if s is None:
-            s = torch.zeros_like(x)
 
-        n = x - s
-        
-        n = n - self.noise_mean
-        n = n / self.noise_std
-        
-        if self.training:
-            pred = self.forward(n)
-        else:
-            pred = self.forward(n).detach()
-            
-        means, stds, weights = self.get_gaussian_params(pred)
-        likelihoods= -0.5*((means-n)/stds)**2 - torch.log(stds) -np.log(2.0*np.pi)*0.5
-        temp = torch.max(likelihoods, dim = 1, keepdim = True)[0].detach()
-        likelihoods=torch.exp( likelihoods -temp) * weights
-        loglikelihoods = torch.log(torch.sum(likelihoods, dim = 1, keepdim = True))
-        loglikelihoods = loglikelihoods + temp 
+        x = (x - self.noise_mean) / self.noise_std
+
+        params = self.forward(x)
+
+        weights, means, stds = get_gaussian_params(params)
+
+        loglikelihoods = Normal(means, stds).log_prob(x)
+        temp = loglikelihoods.max(dim=1, keepdim=True)[0]
+        loglikelihoods = loglikelihoods - temp
+        loglikelihoods = loglikelihoods.exp()
+        loglikelihoods = loglikelihoods * weights
+        loglikelihoods = loglikelihoods.sum(dim=1, keepdim=True)
+        loglikelihoods = loglikelihoods.log()
+        loglikelihoods = loglikelihoods + temp
+
         return loglikelihoods
-    
-    def sampleFromMix(self, means, stds, weights):
-        num_components = means.shape[1]
-        shape = means[:,0,...].shape
-        selector = torch.rand(shape, device = means.device)
-        gauss = torch.normal(means[:,0,...]*0, means[:,0,...]*0 + 1)
-        out = means[:,0,...]*0
 
-        for i in range(num_components):
-            mask = torch.zeros(shape)
-            mask = (selector<weights[:,i,...]) & (selector>0)
-            out += mask* (means[:,i,...] + gauss*stds[:,i,...])
-            selector -= weights[:,i,...]
-        
-        del gauss
-        del selector
-        del shape
-        return out    
-    
     @torch.no_grad()
-    def sample(self, img_shape):
-        """Samples images from the trained autoregressive model.
+    def sample(self, arr_shape):
+        """Samples time series from the trained autoregressive model.
 
         Parameters
         ----------
-        img_shape : List or tuple
-            The shape of the image with format [N, C, H, W], where N is the number
-            of images, C is the colour channel, H is the height of the images, W
-            is the width of the images.
+        arr_shape : List or tuple
+            The shape of the array with format [N, W], where N is the number
+            of arrays, and W is the width.
 
         Returns
         -------
         torch.FloatTensor
-            The generated images.
+            The generated noise.
 
         """
         # Create empty image
-        img = torch.zeros(img_shape, dtype=torch.float).to(self.device)
+        arr = torch.zeros((arr_shape[0], 1, arr_shape[1]), dtype=torch.float).to(
+            self.device
+        )
         # Generation loop
-        for h in tqdm(range(img_shape[2]), leave=False):
-            for w in range(img_shape[3]):
-                for c in range(img_shape[1]):
-                    # For efficiency, we only have to input the upper part of the image
-                    # as all other parts will be skipped by the masked convolutions anyways
-                    pred = self.forward(img[:, :, : h + 1, :])
-                    means, stds, weights = self.get_gaussian_params(pred)
-                    means = means[:,:,h,w][...,np.newaxis,np.newaxis]
-                    stds = stds[:,:,h,w][...,np.newaxis,np.newaxis]
-                    weights = weights[:,:,h,w][...,np.newaxis,np.newaxis]
-                    samp = self.sampleFromMix(means, stds, weights).detach()
-                    img[:, c, h, w] = samp[:,0,0]
-                    
-        return img*self.noise_std + self.noise_mean
-    
-    def training_step(self, batch, batch_idx):
+        for w in tqdm(range(arr.shape[2])):
+            params = self.forward(arr[..., : w + 1])
+            weights, means, stds = get_gaussian_params(params)
+            samp = sampleFromMix(weights, means, stds)
+            arr[..., w] = samp[..., w]
+
+        return arr * self.noise_std + self.noise_mean
+
+    def training_step(self, batch, _):
         loss = -torch.mean(self.loglikelihood(batch))
         self.log("train/nll", loss)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, _):
         loss = -torch.mean(self.loglikelihood(batch))
         self.log("val/nll", loss, prog_bar=True)
-        
+
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
-        return [optimizer], [scheduler]
+        optimizer = optim.Adamax(self.parameters(), lr=self.lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.5, patience=10
+        )
+        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val/nll"}
