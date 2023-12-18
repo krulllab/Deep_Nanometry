@@ -30,4 +30,4 @@ After that, you're ready to install the dependencies for this repository:<br>
 `pip install lightning jupyterlab matplotlib tifffile scikit-image tensorboard`
 
 ### Getting Started
-The 'examples' directory contains notebooks for denoising. They assume data has been stored as .npy files in a 'data' directory as numpy ndarrays with dimensions [Number, Channels, Width].
+The 'examples' directory contains notebooks for denoising and carrying out the analyses in the paper. They assume data has been stored as .npy files in a 'data' directory as numpy ndarrays with dimensions [Number, Channels, Width]. 
