@@ -2,7 +2,7 @@
 
 Yuichiro Iwamoto<sup>1</sup><sup>†</sup>, Benjamin Salmon<sup>2</sup><sup>†</sup>, Yoshiyuki Tsuyama<sup>3</sup>, Miu Tamamitsu<sup>1</sup>, Yusuke Yoshioka<sup>3</sup>, Alexander Krull<sup>2</sup><sup>\*</sup> and Sadao Ota<sup>1</sup><sup>\*</sup></br>
 
-<sup>1</sup>Research Center for Advanced Science and Technology, The University of Tokyo, Meguro-ku 4-6-1, Shibuya, Tokyo 153-8904, Japan.<br>
+<sup>1</sup>Research Center for Advanced Science and Technology, The University of Tokyo, Komaba 4-6-1, Meguro, Tokyo 153-8904, Japan.<br>
 <sup>2</sup>School of Computer Science, University of Birmingham, B15 2TT, Birmingham, United Kingdom.<br>
 <sup>3</sup>Department of Molecular and Cellular Medicine, Institute of Medical Science, Tokyo Medical University, Nishishinjuku 6-7-1, Shinjuku, Tokyo 160-0023, Japan.<br>
 
