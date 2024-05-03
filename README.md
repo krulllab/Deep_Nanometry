@@ -30,5 +30,7 @@ Next, install PyTorch and torchvision for your system by following this [link](h
 After that, you're ready to install the dependencies for this repository:<br>
 `pip install lightning jupyterlab matplotlib tifffile scikit-image tensorboard`
 
+Our enviroments: Windows 11(23H2), Python 3.11.5 (lightning 2.2.1, jupyterlab 3.6.4, matplotlib 3.7.2, tifffile 2023.4.12, scikit-image 0.22.0 ,tensorboard 2.16.2)
+
 ### Getting Started
 The 'examples' directory contains notebooks for denoising and carrying out the analyses in the paper. They assume data has been stored as .npy files in a 'data' directory as numpy ndarrays with dimensions [Number, Channels, Width]. 
